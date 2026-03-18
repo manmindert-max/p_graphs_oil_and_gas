@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pandas as pd
 import streamlit as st
 
 from .data import load_data
@@ -40,9 +41,6 @@ def sidebar_settings():
 
 
 def get_app_context():
-    with st.sidebar:
-        decline_mode, forecast_extension_months, q_min, iqr_factor = sidebar_settings()
-
     default_path = Path(__file__).resolve().parents[1] / "env_csv-Production-e788d_2026-03-16.csv"
     if not default_path.exists():
         st.error(f"Default data file not found: {default_path}")
@@ -55,16 +53,56 @@ def get_app_context():
         st.error(f"❌ Could not load file: {e}")
         st.stop()
 
-    all_wells = sorted(df["WellName"].unique())
+    # Sidebar controls (now that we know the date range in the dataset)
+    prod_min = df["ProducingMonth"].min()
+    prod_max = df["ProducingMonth"].max()
+    min_date = prod_min.date() if prod_min is not None and prod_min == prod_min else None
+    max_date = prod_max.date() if prod_max is not None and prod_max == prod_max else None
+
+    with st.sidebar:
+        decline_mode, forecast_extension_months, q_min, iqr_factor = sidebar_settings()
+        st.markdown("---")
+        enable_prod_date_filter = st.checkbox(
+            "Filter wells by production date",
+            value=False,
+            help="Keep only wells that have at least one non-zero production record on/after the cutoff date.",
+        )
+        prod_date_cutoff = st.date_input(
+            "Include wells with production on/after",
+            value=min_date,
+            min_value=min_date,
+            max_value=max_date,
+            disabled=not enable_prod_date_filter,
+        )
+
+    all_wells_total = sorted(df["WellName"].unique())
+    eligible_wells = set(all_wells_total)
+    if enable_prod_date_filter and prod_date_cutoff is not None:
+        cutoff_ts = df["ProducingMonth"].dt.tz_localize(None) >= pd.Timestamp(prod_date_cutoff)
+        nonzero = (df["LiquidsProd_BBL"] > 0) | (df["GasProd_MCF"] > 0) | (df["WaterProd_BBL"] > 0)
+        eligible_wells = set(df.loc[cutoff_ts & nonzero, "WellName"].unique().tolist())
+
+    all_wells = sorted(eligible_wells)
     st.success(
-        f"✅ Loaded **{len(df):,}** records across **{len(all_wells)}** wells "
-        f"from `{default_path.name}`."
+        f"✅ Loaded `{default_path.name}`: **{len(df):,}** records across **{len(all_wells_total)}** wells."
     )
+    if enable_prod_date_filter:
+        st.info(
+            f"Date filter active: **{len(all_wells)} / {len(all_wells_total)}** wells have non-zero production "
+            f"on/after **{prod_date_cutoff.isoformat()}**."
+        )
+        if not all_wells:
+            st.error("No wells match the selected production-date filter.")
+            st.stop()
 
     with st.spinner("Fitting Arps curves for all wells…"):
         all_fits_full, all_eurs_full, all_subs_full = fit_all_wells_cached(
             raw_bytes, decline_mode, forecast_extension_months, q_min
         )
+        # Re-scope to eligible wells (if a date filter is active)
+        all_fits_full = {w: all_fits_full[w] for w in all_wells}
+        all_eurs_full = {w: all_eurs_full[w] for w in all_wells}
+        all_subs_full = {w: all_subs_full[w] for w in all_wells}
 
     outlier_df = detect_outliers(all_eurs_full, iqr_factor=iqr_factor)
     flagged = outlier_df[outlier_df["Outlier"]].index.tolist()
@@ -121,6 +159,8 @@ def get_app_context():
         "decline_mode": decline_mode,
         "forecast_extension_months": forecast_extension_months,
         "q_min": q_min,
+        "enable_prod_date_filter": enable_prod_date_filter,
+        "prod_date_cutoff": prod_date_cutoff,
         "iqr_factor": iqr_factor,
         "all_wells": all_wells,
         "active_wells": active_wells,
